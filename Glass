@@ -1,0 +1,101 @@
+import tensorflow as tf
+from tensorflow.keras import layers, models
+
+def build_custom_mobilenet(input_shape=(224, 224, 3), num_classes=2):
+    """
+    제공된 JSON 구조를 기반으로 재구성한 MobileNetV2 기반의 이진/다중 분류 모델입니다.
+    """
+    inputs = layers.Input(shape=input_shape, name="input_1")
+    
+    # 1. 진입부 (Stem)
+    x = layers.ZeroPadding2D(padding=((0, 1), (0, 1)), name="Conv1_pad")(inputs)
+    x = layers.Conv2D(filters=16, kernel_size=(3, 3), strides=(2, 2), padding="valid", use_bias=False, name="Conv1")(x)
+    x = layers.BatchNormalization(momentum=0.999, epsilon=0.001, name="bn_Conv1")(x)
+    x = layers.ReLU(max_value=6, name="Conv1_relu")(x)
+    
+    # 2. Expanded Conv (Block 0)
+    x = layers.DepthwiseConv2D(kernel_size=(3, 3), strides=(1, 1), padding="same", use_bias=False, name="expanded_conv_depthwise")(x)
+    x = layers.BatchNormalization(momentum=0.999, epsilon=0.001, name="expanded_conv_depthwise_BN")(x)
+    x = layers.ReLU(max_value=6, name="expanded_conv_depthwise_relu")(x)
+    x = layers.Conv2D(filters=8, kernel_size=(1, 1), strides=(1, 1), padding="same", use_bias=False, name="expanded_conv_project")(x)
+    x = layers.BatchNormalization(momentum=0.999, epsilon=0.001, name="expanded_conv_project_BN")(x)
+    
+    # Bottleneck 블록 정의를 위한 헬퍼 함수
+    def bottleneck_block(inputs, expand_filters, project_filters, stride, block_num, shortcut=True):
+        prefix = f"block_{block_num}_"
+        
+        # 1. Expand
+        x = layers.Conv2D(filters=expand_filters, kernel_size=(1, 1), strides=(1, 1), padding="same", use_bias=False, name=prefix + "expand")(inputs)
+        x = layers.BatchNormalization(momentum=0.999, epsilon=0.001, name=prefix + "expand_BN")(x)
+        x = layers.ReLU(max_value=6, name=prefix + "expand_relu")(x)
+        
+        # Stride가 2일 때 패딩 처리
+        if stride == 2:
+            x = layers.ZeroPadding2D(padding=((0, 1), (0, 1)), name=prefix + "pad")(x)
+            padding_type = "valid"
+        else:
+            padding_type = "same"
+            
+        # 2. Depthwise
+        x = layers.DepthwiseConv2D(kernel_size=(3, 3), strides=(stride, stride), padding=padding_type, use_bias=False, name=prefix + "depthwise")(x)
+        x = layers.BatchNormalization(momentum=0.999, epsilon=0.001, name=prefix + "depthwise_BN")(x)
+        x = layers.ReLU(max_value=6, name=prefix + "depthwise_relu")(x)
+        
+        # 3. Project
+        x = layers.Conv2D(filters=project_filters, kernel_size=(1, 1), strides=(1, 1), padding="same", use_bias=False, name=prefix + "project")(x)
+        x = layers.BatchNormalization(momentum=0.999, epsilon=0.001, name=prefix + "project_BN")(x)
+        
+        # 4. Residual Connection (Shortcut)
+        if shortcut:
+            x = layers.add([inputs, x], name=prefix + "add")
+            
+        return x
+
+    # Bottleneck Blocks 차례대로 쌓기 (JSON 구조 기반)
+    # block 1 (No shortcut, stride 2)
+    x = bottleneck_block(x, expand_filters=48, project_filters=8, stride=2, block_num=1, shortcut=False)
+    # block 2 (With shortcut, stride 1)
+    x = bottleneck_block(x, expand_filters=48, project_filters=8, stride=1, block_num=2, shortcut=True)
+    # block 3 (No shortcut, stride 2)
+    x = bottleneck_block(x, expand_filters=48, project_filters=16, stride=2, block_num=3, shortcut=False)
+    # block 4 & 5 (With shortcut, stride 1)
+    x = bottleneck_block(x, expand_filters=96, project_filters=16, stride=1, block_num=4, shortcut=True)
+    x = bottleneck_block(x, expand_filters=96, project_filters=16, stride=1, block_num=5, shortcut=True)
+    # block 6 (No shortcut, stride 2)
+    x = bottleneck_block(x, expand_filters=96, project_filters=24, stride=2, block_num=6, shortcut=False)
+    # block 7 & 8 & 9 (With shortcut, stride 1)
+    x = bottleneck_block(x, expand_filters=144, project_filters=24, stride=1, block_num=7, shortcut=True)
+    x = bottleneck_block(x, expand_filters=144, project_filters=24, stride=1, block_num=8, shortcut=True)
+    x = bottleneck_block(x, expand_filters=144, project_filters=24, stride=1, block_num=9, shortcut=True)
+    # block 10 (No shortcut, stride 1 - 채널 변경되므로 shortcut 제외)
+    x = bottleneck_block(x, expand_filters=144, project_filters=32, stride=1, block_num=10, shortcut=False)
+    # block 11 & 12 (With shortcut, stride 1)
+    x = bottleneck_block(x, expand_filters=192, project_filters=32, stride=1, block_num=11, shortcut=True)
+    x = bottleneck_block(x, expand_filters=192, project_filters=32, stride=1, block_num=12, shortcut=True)
+    # block 13 (No shortcut, stride 2)
+    x = bottleneck_block(x, expand_filters=192, project_filters=56, stride=2, block_num=13, shortcut=False)
+    # block 14 & 15 (With shortcut, stride 1)
+    x = bottleneck_block(x, expand_filters=336, project_filters=56, stride=1, block_num=14, shortcut=True)
+    x = bottleneck_block(x, expand_filters=336, project_filters=56, stride=1, block_num=15, shortcut=True)
+    # block 16 (No shortcut, stride 1 - 채널 대폭 상승)
+    x = bottleneck_block(x, expand_filters=336, project_filters=112, stride=1, block_num=16, shortcut=False)
+
+    # 3. Head & Classifier
+    x = layers.Conv2D(filters=1280, kernel_size=(1, 1), strides=(1, 1), padding="valid", use_bias=False, name="Conv_1")(x)
+    x = layers.BatchNormalization(momentum=0.999, epsilon=0.001, name="Conv_1_bn")(x)
+    x = layers.ReLU(max_value=6, name="out_relu")(x)
+    
+    # Pooling
+    x = layers.GlobalAveragePooling2D(name="global_average_pooling2d_GlobalAveragePooling2D1")(x)
+    
+    # Dense Classifier (Sequential 3 구조 모방)
+    x = layers.Dense(units=100, activation="relu", name="dense_Dense1")(x)
+    outputs = layers.Dense(units=num_classes, activation="softmax", use_bias=False, name="dense_Dense2")(x)
+    
+    model = models.Model(inputs=inputs, outputs=outputs, name="custom_mobilenet_v2")
+    return model
+
+if __name__ == "__main__":
+    # 모델 빌드 및 구조 요약 출력
+    model = build_custom_mobilenet()
+    model.summary()
